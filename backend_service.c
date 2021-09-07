@@ -14,27 +14,87 @@
 #include <syslog.h>
 #include <errno.h>
 
-const char * const socket_path = "/tmp/backend.service.sock";
-const char * const end_string = "[end]";
+const char * const SOCKET_PATH = "@backend.service.sock";
+const char * const END_STRING = "[end]";
 
-#define buffer_size (4 * 1024 * 1024) // 4MB
-static char buffer[buffer_size] = {0};
+#define BUFFER_SIZE (4 * 1024 * 1024) // 4MB
+static char BUFFER[BUFFER_SIZE] = {0};
+
+static ssize_t safe_read(int fd, void *buf, size_t count)
+{
+    ssize_t rc = 0;
+    size_t need_to_read = count;
+    void * read_buf = buf;
+
+    do {
+        rc = read(fd, read_buf, need_to_read);
+        if (rc <= 0) {
+            if (errno == EINTR)
+                continue;
+            if (rc < 0)
+                return rc;
+            break;
+        }
+
+        read_buf = (void *)((char *)read_buf + rc);
+        need_to_read -= rc;
+    } while (need_to_read != 0);
+
+    return count - need_to_read;
+}
+
+static ssize_t safe_write(int fd, const void *buf, size_t count)
+{
+    ssize_t rc = 0;
+    size_t need_to_write = count;
+    const void * write_buf = buf;
+
+    do {
+        rc = write(fd, write_buf, need_to_write);
+        if (rc <= 0) {
+            if (errno == EINTR)
+                continue;
+            if (rc < 0)
+                return rc;
+            break;
+        }
+
+        need_to_write -= rc;
+        write_buf = (void *)((char *)write_buf + rc);
+    } while (need_to_write != 0);
+
+    return count - need_to_write;
+}
 
 static int create_listen_socket()
 {
     int s = socket(AF_LOCAL, SOCK_STREAM | SOCK_NONBLOCK, 0);
 
-    unlink(socket_path);
-
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_LOCAL;
-    strncpy(sa.sun_path, socket_path, sizeof sa.sun_path - 1);
+    strncpy(sa.sun_path, SOCKET_PATH, sizeof sa.sun_path - 1);
+    if (sa.sun_path[0] == '@') {
+        sa.sun_path[0] = 0;
+    }
 
     int rc = bind(s, (struct sockaddr *) &sa, sizeof(sa));
 
     listen(s, 1);
     return s;
+}
+
+static void redirect_std_to_null(void)
+{
+    int fd;
+    if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
+        (void) dup2(fd, STDIN_FILENO);
+        (void) dup2(fd, STDOUT_FILENO);
+        (void) dup2(fd, STDERR_FILENO);
+        if (fd > 2) {
+            (void) close(fd);
+        }
+    }
 }
 
 static void dealwith_client(int fd)
@@ -44,21 +104,21 @@ static void dealwith_client(int fd)
     dup2(STDOUT_FILENO, STDERR_FILENO);
 
     int32_t argc = 0;
-    memset(buffer, 0, buffer_size);
-    int ret = read(fd, &argc, sizeof argc);
+    memset(BUFFER, 0, BUFFER_SIZE);
+    int ret = safe_read(fd, &argc, sizeof argc);
     if (ret < 0) {
         printf("read argc from client error: %d errno: %d\n", ret, errno);
     }
 
     int32_t len = 0;
     char * argv[argc];
-    char * pBuf = buffer;
+    char * pBuf = BUFFER;
     for (int i = 0; i < argc; i++) {
-        ret = read(fd, &len, sizeof len);
+        ret = safe_read(fd, &len, sizeof len);
         if (ret < 0) {
             printf("read argv[%d] length from client error: %d errno: %d\n", i, ret, errno);
         }
-        ret = read(fd, pBuf, len);
+        ret = safe_read(fd, pBuf, len);
         if (ret < 0) {
             printf("read argv[%d] content from client error: %d errno: %d\n", i, ret, errno);
         }
@@ -70,7 +130,9 @@ static void dealwith_client(int fd)
         printf("argv[%d]: %s\n", i, argv[i]);
     }
 
-    printf("%s\n", end_string);
+    printf("%s\n", END_STRING);
+
+    redirect_std_to_null();
 }
 
 static int start_backend_service(void)
@@ -80,13 +142,7 @@ static int start_backend_service(void)
         return -1;
     case 0:
         break;
-    default: {
-        // wait bacend startup
-        int wait_time = 100;
-        while (access(socket_path, F_OK) != 0 && (wait_time-- > 0)) {
-            usleep(100 * 1000);
-        }
-    }
+    default:
         return 0;
     }
 
@@ -95,16 +151,8 @@ static int start_backend_service(void)
     }
 
     (void) chdir("/");
+    redirect_std_to_null();
 
-    int fd;
-    if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
-        (void) dup2(fd, STDIN_FILENO);
-        (void) dup2(fd, STDOUT_FILENO);
-        (void) dup2(fd, STDERR_FILENO);
-        if (fd > 2) {
-            (void) close(fd);
-        }
-    }
     setvbuf(stdout, NULL, _IONBF, 0);
 
     int s = create_listen_socket();
@@ -130,27 +178,27 @@ static int start_backend_service(void)
     return 0;
 }
 
-// buffer layout
+// BUFFER layout
 // __________________________________________________
 // |4B | 4B| payload | 4B | payload|...|4B| payload |
 // --------------------------------------------------
 //
 static int encode_input(int32_t argc, char * argv[])
 {
-    memset(buffer, 0, buffer_size);
-    memcpy(buffer, &argc, sizeof(argc));
+    memset(BUFFER, 0, BUFFER_SIZE);
+    memcpy(BUFFER, &argc, sizeof(argc));
     int32_t count = sizeof(argc);
     int32_t len = 0;
 
     for (int i = 0; i < argc; i++) {
         len = strlen(argv[i]) + 1;
-        if (count + len > buffer_size) {
+        if (count + len > BUFFER_SIZE) {
             printf("the input data is too long!\n");
             return count;
         }
-        memcpy(&buffer[count], &len, sizeof(len));
+        memcpy(&BUFFER[count], &len, sizeof(len));
         count += sizeof(len);
-        memcpy(&buffer[count], argv[i], len);
+        memcpy(&BUFFER[count], argv[i], len);
         count += len;
     }
     return count;
@@ -163,15 +211,31 @@ static int connect_to_backend()
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_LOCAL;
-    strncpy(sa.sun_path, socket_path, sizeof sa.sun_path - 1);
-
-    int ret = connect(s, (struct sockaddr *) &sa, sizeof sa);
-    if (ret != 0) {
-        printf("Failed to connect backend\n");
-        close(s);
-        return ret;
+    strncpy(sa.sun_path, SOCKET_PATH, sizeof sa.sun_path - 1);
+    if (sa.sun_path[0] == '@') {
+        sa.sun_path[0] = 0;
     }
-    return s;
+
+    int wait_time = 100;
+    int ret = 0;
+    do {
+        ret = connect(s, (struct sockaddr *) &sa, sizeof sa);
+        if (ret == 0) {
+            return s;
+        }
+
+        if (errno == ECONNREFUSED) {
+            if (wait_time == 100) { // only start the backend service when the first connect failed
+                start_backend_service();
+            }
+            wait_time--;
+            usleep(100 * 1000);
+        }
+    } while (wait_time > 0);
+
+    printf("Failed to connect backend %d, errno(%d)\n", ret, errno);
+    close(s);
+    return ret;
 }
 
 static int send_input_to_backend(int s, int argc, char *argv[])
@@ -182,14 +246,14 @@ static int send_input_to_backend(int s, int argc, char *argv[])
         return len;
     }
 
-    return write(s, buffer, len);
+    return safe_write(s, BUFFER, len);
 }
 
 static int readline(int fd, char * buf, int size)
 {
     int ret = 0;
     int i = 0;
-    while(((ret = read(fd, &buf[i], 1)) == 1) && (i < size)) {
+    while(((ret = safe_read(fd, &buf[i], 1)) == 1) && (i < size)) {
         if (buf[i++] == '\n') {
             buf[i - 1] = 0;
             break;
@@ -203,12 +267,12 @@ static int wait_and_print_backend_output(int s)
 {
     int ret = 0;
     while (1) {
-        memset(buffer, 0, buffer_size);
-        ret = readline(s, buffer, buffer_size);
-        if (!strcmp(end_string, buffer)) {
+        memset(BUFFER, 0, BUFFER_SIZE);
+        ret = readline(s, BUFFER, BUFFER_SIZE);
+        if (!strcmp(END_STRING, BUFFER)) {
             break;
         }
-        printf("%s\n", buffer);
+        printf("%s\n", BUFFER);
         if (ret < 0) {
             break;
         }
@@ -218,10 +282,6 @@ static int wait_and_print_backend_output(int s)
 
 int main(int argc, char *argv[])
 {
-    if (access(socket_path, F_OK)) {
-        start_backend_service();
-    }
-
     int s = connect_to_backend();
     if (s < 0) {
         return -1;
