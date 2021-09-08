@@ -1,21 +1,19 @@
-#include <stdio.h>
-#include <stdio.h>
-
-#include <sys/types.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <sys/select.h>
-
-#include <syslog.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <string.h>
+#include <unistd.h>
 
-const char * const SOCKET_PATH = "@backend.service.sock";
-const char * const END_STRING = "[end]";
+extern const char * const _SOCKET_PATH_NAME;
+extern int _bg_main(int argc, char *argv[]);
+
+static const char * const END_STRING = "[@return_result_value@]";
 
 #define BUFFER_SIZE (4 * 1024 * 1024) // 4MB
 static char BUFFER[BUFFER_SIZE] = {0};
@@ -73,7 +71,7 @@ static int create_listen_socket()
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_LOCAL;
-    strncpy(sa.sun_path, SOCKET_PATH, sizeof sa.sun_path - 1);
+    strncpy(sa.sun_path, _SOCKET_PATH_NAME, sizeof sa.sun_path - 1);
     if (sa.sun_path[0] == '@') {
         sa.sun_path[0] = 0;
     }
@@ -126,11 +124,10 @@ static void dealwith_client(int fd)
         pBuf += len;
     }
 
-    for (int i = 0; i < argc; i++) {
-        printf("argv[%d]: %s\n", i, argv[i]);
-    }
+    ret = _bg_main(argc, argv);
 
     printf("%s\n", END_STRING);
+    safe_write(fd, &ret, sizeof ret);
 
     redirect_std_to_null();
 }
@@ -178,32 +175,6 @@ static int start_backend_service(void)
     return 0;
 }
 
-// BUFFER layout
-// __________________________________________________
-// |4B | 4B| payload | 4B | payload|...|4B| payload |
-// --------------------------------------------------
-//
-static int encode_input(int32_t argc, char * argv[])
-{
-    memset(BUFFER, 0, BUFFER_SIZE);
-    memcpy(BUFFER, &argc, sizeof(argc));
-    int32_t count = sizeof(argc);
-    int32_t len = 0;
-
-    for (int i = 0; i < argc; i++) {
-        len = strlen(argv[i]) + 1;
-        if (count + len > BUFFER_SIZE) {
-            printf("the input data is too long!\n");
-            return count;
-        }
-        memcpy(&BUFFER[count], &len, sizeof(len));
-        count += sizeof(len);
-        memcpy(&BUFFER[count], argv[i], len);
-        count += len;
-    }
-    return count;
-}
-
 static int connect_to_backend()
 {
     int s = socket(AF_LOCAL, SOCK_STREAM, 0);
@@ -211,7 +182,7 @@ static int connect_to_backend()
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
     sa.sun_family = AF_LOCAL;
-    strncpy(sa.sun_path, SOCKET_PATH, sizeof sa.sun_path - 1);
+    strncpy(sa.sun_path, _SOCKET_PATH_NAME, sizeof sa.sun_path - 1);
     if (sa.sun_path[0] == '@') {
         sa.sun_path[0] = 0;
     }
@@ -236,6 +207,32 @@ static int connect_to_backend()
     printf("Failed to connect backend %d, errno(%d)\n", ret, errno);
     close(s);
     return ret;
+}
+
+// BUFFER layout
+// __________________________________________________
+// |4B | 4B| payload | 4B | payload|...|4B| payload |
+// --------------------------------------------------
+//
+static int encode_input(int32_t argc, char * argv[])
+{
+    memset(BUFFER, 0, BUFFER_SIZE);
+    memcpy(BUFFER, &argc, sizeof(argc));
+    int32_t count = sizeof(argc);
+    int32_t len = 0;
+
+    for (int i = 0; i < argc; i++) {
+        len = strlen(argv[i]) + 1;
+        if (count + len > BUFFER_SIZE) {
+            printf("the input data is too long!\n");
+            return count;
+        }
+        memcpy(&BUFFER[count], &len, sizeof(len));
+        count += sizeof(len);
+        memcpy(&BUFFER[count], argv[i], len);
+        count += len;
+    }
+    return count;
 }
 
 static int send_input_to_backend(int s, int argc, char *argv[])
@@ -269,15 +266,19 @@ static int wait_and_print_backend_output(int s)
     while (1) {
         memset(BUFFER, 0, BUFFER_SIZE);
         ret = readline(s, BUFFER, BUFFER_SIZE);
+        if (ret <= 0) {
+            printf("Fail to read data from backend.[%d]\n", ret);
+            return ret;
+        }
+
+        // capture the return value
         if (!strcmp(END_STRING, BUFFER)) {
-            break;
+            safe_read(s, &ret, sizeof ret);
+            return ret;
         }
         printf("%s\n", BUFFER);
-        if (ret < 0) {
-            break;
-        }
     }
-    return ret;
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -292,5 +293,5 @@ int main(int argc, char *argv[])
 
     close(s);
 
-    return 0;
+    return ret;
 }
